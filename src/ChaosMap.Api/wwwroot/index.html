@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GCE Chaos Map</title>
+  <meta name="description" content="Kill a VM, a zone or a whole region and watch a global load balancer and regional managed instance groups heal.">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <h1>GCE Chaos Map</h1>
+      <p>Break a VM, a zone or a whole region. Watch the load balancer route around it and the managed instance groups heal.</p>
+    </div>
+    <div class="badges">
+      <span id="mode" class="badge" title="Where the fleet comes from">…</span>
+      <span id="conn" class="badge conn off" title="Live connection to the server">connecting</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="stage" aria-label="World map of the fleet">
+      <div class="map-wrap" id="mapWrap">
+        <svg id="map" viewBox="0 0 1000 520" role="group" aria-label="Regions, zones and virtual machines"></svg>
+        <canvas id="fx" aria-hidden="true"></canvas>
+      </div>
+
+      <ul class="legend" aria-label="Legend">
+        <li><i class="sw healthy"></i>Healthy, taking traffic</li>
+        <li><i class="sw starting"></i>Running, health check pending</li>
+        <li><i class="sw staging"></i>Staging</li>
+        <li><i class="sw provisioning"></i>Provisioning</li>
+        <li><i class="sw stopping"></i>Being deleted</li>
+        <li><i class="dot ok"></i>Request served</li>
+        <li><i class="dot failover"></i>Served by a farther region</li>
+        <li><i class="dot fail"></i>Failed</li>
+      </ul>
+      <p class="hint"><b>Click a VM</b> to delete it. <b>Click a zone letter</b> to fail that zone. <b>Fail region</b> takes out a whole region. The dots are synthetic users; the fleet state is the model's (or Compute Engine's) real answer.</p>
+    </section>
+
+    <aside class="side">
+      <section class="panel" aria-labelledby="hHealth">
+        <h2 id="hHealth">Global health</h2>
+        <div class="kpis">
+          <div class="kpi"><span class="v" id="kHealthy">–</span><span class="l">VMs healthy</span></div>
+          <div class="kpi"><span class="v" id="kSuccess">–</span><span class="l">requests OK (10s)</span></div>
+          <div class="kpi"><span class="v" id="kP50">–</span><span class="l">p50 latency</span></div>
+          <div class="kpi"><span class="v" id="kP95">–</span><span class="l">p95 latency</span></div>
+        </div>
+        <div class="spark-label">Success rate, last minute</div>
+        <svg id="sparkOk" class="spark" viewBox="0 0 300 44" preserveAspectRatio="none" aria-hidden="true"></svg>
+        <div class="spark-label">p95 latency, last minute</div>
+        <svg id="sparkLat" class="spark" viewBox="0 0 300 44" preserveAspectRatio="none" aria-hidden="true"></svg>
+      </section>
+
+      <section class="panel" aria-labelledby="hChaos">
+        <h2 id="hChaos">Chaos</h2>
+        <div class="row">
+          <button id="auto" class="btn" aria-pressed="false">Auto-chaos: off</button>
+          <button id="reset" class="btn ghost">Reset fleet</button>
+        </div>
+        <p class="muted small">Auto-chaos deletes a random healthy VM every few seconds. Guardrails refuse anything that would leave less than <span id="floor">34</span>% of the fleet healthy.</p>
+      </section>
+
+      <section class="panel" aria-labelledby="hTraffic">
+        <h2 id="hTraffic">Where traffic is landing</h2>
+        <ul id="byRegion" class="bars"></ul>
+      </section>
+
+      <section class="panel grow" aria-labelledby="hInc">
+        <h2 id="hInc">Incidents</h2>
+        <ul id="incidents" class="incidents" aria-live="polite"></ul>
+        <p id="noInc" class="muted small">Nothing has broken yet. Go on.</p>
+      </section>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/dist/topojson-client.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr@8.0.7/dist/browser/signalr.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

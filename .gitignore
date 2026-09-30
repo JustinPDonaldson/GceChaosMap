@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+.claude/
+*.user
+appsettings.*.local.json
+*.tfstate
+*.tfstate.*
+.terraform/
