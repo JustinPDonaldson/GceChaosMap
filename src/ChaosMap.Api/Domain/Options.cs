@@ -56,6 +56,9 @@ public sealed class GceOptions
 
     public string ProjectId { get; set; } = "";
     public double PollSeconds { get; set; } = 2;
+
+    /// <summary>How long a zone or region evacuation lasts before the MIG's full configuration is restored.</summary>
+    public double OutageSeconds { get; set; } = 180;
 }
 
 public sealed class ChaosOptions

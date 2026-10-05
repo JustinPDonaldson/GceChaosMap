@@ -13,9 +13,29 @@ ASP.NET Core (.NET 10) + SignalR on the back end, plain JS + D3 + canvas on the 
 ```bash
 dotnet run --project src/ChaosMap.Api --urls http://localhost:5116
 dotnet test
+node --test "tests/js/*.test.js"
 ```
 
 Open <http://localhost:5116>. The default `Simulation` provider needs no cloud account and costs nothing.
+
+## GitHub Pages (no server)
+
+The page can run entirely in the browser, so it can be hosted on static hosting. `wwwroot/sim.js` is a JavaScript port of
+the C# simulation, and `wwwroot/backends.js` picks where frames come from:
+
+| Situation | Backend |
+|---|---|
+| ASP.NET app answers `api/config` | server (SignalR + `/api/chaos/*`), simulated or live Compute Engine |
+| No server (GitHub Pages, any static host) | in-browser simulation |
+| `?mode=sim` in the URL | in-browser simulation, even when a server exists |
+
+To publish: push to a **public** GitHub repo on `main`, then in the repo go to Settings, Pages, and set Source to
+**GitHub Actions**. `.github/workflows/pages.yml` runs the JS tests and publishes only `src/ChaosMap.Api/wwwroot`.
+The site appears at `https://<user>.github.io/<repo>/`.
+
+Two implementations of the simulation exist, so they must stay in step. `tests/js/sim.test.js` ports the C# test cases and
+fails if `sim-config.js` drifts from `appsettings.json`, but a change to the model's rules in C# still has to be made in
+`sim.js` by hand.
 
 ## Architecture
 
@@ -49,7 +69,8 @@ Use a **dedicated project** and a service account limited to `compute.instanceGr
 
 Known differences from simulation:
 
-- "Fail zone" / "Fail region" delete the VMs in that zone/region; there is no real zone outage, so the MIG may recreate VMs in the same zone. Draining a zone from the MIG's distribution policy is the next step.
+- **Fail zone** removes the zone from the MIG's distribution policy (so replacements cannot land there), then deletes the VMs in it. **Fail region** resizes the MIG to zero. After `Gce:OutageSeconds` (default 180) the original zones and size are restored. "Down" is read back from Compute Engine each poll, so an outage that outlives the app is still noticed and restored, and **Reset fleet** restores immediately.
+- These two actions need `compute.instanceGroupManagers.update` in the `chaosMapRunner` role. Patching a MIG may also need `iam.serviceAccounts.actAs` on the fleet VM service account; this has not been confirmed against a real project yet.
 - The synthetic users are still simulated; only fleet state is real.
 
 ## Known limitations

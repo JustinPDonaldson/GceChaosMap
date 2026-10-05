@@ -19,6 +19,15 @@ public class GceMappingTests
         Assert.Equal(expected, GceFleetProvider.MapState(action, status, health));
 
     [Theory]
+    [InlineData("projects/gcechaosmap/zones/us-central1-b", "us-central1-b")]
+    [InlineData("https://www.googleapis.com/compute/v1/projects/p/zones/europe-west1-d", "europe-west1-d")]
+    [InlineData("us-central1-c", "us-central1-c")]
+    [InlineData("", "")]
+    [InlineData(null, "")]
+    public void Extracts_zone_name_from_a_distribution_policy_entry(string? url, string expected) =>
+        Assert.Equal(expected, GceFleetProvider.LastSegment(url));
+
+    [Theory]
     [InlineData("https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a/instances/web-x", "us-central1-a")]
     [InlineData("zones/europe-west1-b/instances/y", null)] // no leading slash before the marker: refuse to guess
     [InlineData("", null)]

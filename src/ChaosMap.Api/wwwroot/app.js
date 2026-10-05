@@ -2,7 +2,7 @@
   'use strict';
 
   const W = 1000, H = 520;
-  const CARD = { w: 178, h: 108, head: 26, zoneTop: 32, zoneH: 15, cell: 17, cols: 3, footer: 14 };
+  const CARD = { w: 178, h: 108, head: 26, zoneTop: 32, zoneH: 15, cell: 15, cols: 3, footer: 14 };
   const AUTO_CHAOS_MS = 6000;
   const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -11,6 +11,7 @@
   const canvas = $('fx');
   const ctx = canvas.getContext('2d');
 
+  let backend = null;      // server (SignalR + REST) or the in-browser simulation, see backends.js
   let config = null;
   let projection = null;
   let regionPos = {};      // region id -> {x, y} pin position in map units
@@ -28,10 +29,11 @@
   });
 
   async function init() {
-    config = await (await fetch('/api/config')).json();
+    backend = await ChaosBackends.choose();
+    config = await backend.getConfig();
 
     const modeEl = $('mode');
-    modeEl.textContent = config.mode === 'gce' ? 'Live · Compute Engine' : 'Simulation';
+    modeEl.textContent = config.mode === 'gce' ? 'Live · Compute Engine' : config.local ? 'Simulation · in your browser' : 'Simulation';
     modeEl.classList.add(config.mode === 'gce' ? 'gce' : 'sim');
     $('floor').textContent = config.minHealthyPercent;
     if (!config.chaosEnabled) {
@@ -75,15 +77,61 @@
     });
   }
 
-  function cardOrigin(region) {
-    const { x, y } = regionPos[region.id];
-    const north = region.lat > 10;
-    const cx = Math.max(6, Math.min(W - CARD.w - 6, x - CARD.w / 2));
-    const cy = north ? y - CARD.h - 22 : y + 22;
-    return { x: cx, y: Math.max(4, Math.min(H - CARD.h - 4, cy)), north };
+  let layout = {};         // region id -> {x, y} top-left of its card
+
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  // Give every region the nearest free corner of the map, so cards never sit on top of the land they describe.
+  // A brute-force search over one-to-one assignments is fine: there are at most four corners.
+  function assignCorners(regions) {
+    const m = 8;
+    const corners = [
+      { x: m, y: m },
+      { x: W - CARD.w - m, y: m },
+      { x: m, y: H - CARD.h - m },
+      { x: W - CARD.w - m, y: H - CARD.h - m },
+    ];
+    const cost = (r, c) => Math.hypot(regionPos[r.id].x - (c.x + CARD.w / 2), regionPos[r.id].y - (c.y + CARD.h / 2));
+    const n = Math.min(regions.length, corners.length);
+    const used = new Array(corners.length).fill(false);
+    let best = { total: Infinity, pick: [] };
+
+    (function search(i, total, pick) {
+      if (total >= best.total) return;
+      if (i === n) { best = { total, pick: pick.slice() }; return; }
+      for (let c = 0; c < corners.length; c++) {
+        if (used[c]) continue;
+        used[c] = true; pick.push(c);
+        search(i + 1, total + cost(regions[i], corners[c]), pick);
+        pick.pop(); used[c] = false;
+      }
+    })(0, 0, []);
+
+    const out = {};
+    regions.slice(0, n).forEach((r, i) => { out[r.id] = corners[best.pick[i]]; });
+    // A fifth region or more has no corner left: sit it just below its own pin.
+    regions.slice(n).forEach((r) => {
+      const p = regionPos[r.id];
+      out[r.id] = { x: clamp(p.x - CARD.w / 2, 6, W - CARD.w - 6), y: clamp(p.y + 22, 4, H - CARD.h - 4) };
+    });
+    return out;
   }
 
+  // Midpoint of whichever side of the card is closest to the pin: the line leaves the card from that edge.
+  function edgeAnchor(origin, pin) {
+    const sides = [
+      { x: origin.x + CARD.w / 2, y: origin.y },
+      { x: origin.x + CARD.w / 2, y: origin.y + CARD.h },
+      { x: origin.x, y: origin.y + CARD.h / 2 },
+      { x: origin.x + CARD.w, y: origin.y + CARD.h / 2 },
+    ];
+    return sides.reduce((a, b) => (Math.hypot(a.x - pin.x, a.y - pin.y) <= Math.hypot(b.x - pin.x, b.y - pin.y) ? a : b));
+  }
+
+  const cardOrigin = (region) => layout[region.id];
+
   function buildCards() {
+    layout = assignCorners(config.regions);
     const layer = svg.append('g').attr('id', 'cards');
 
     const cards = layer.selectAll('g.card').data(config.regions, (r) => r.id).join('g')
@@ -93,9 +141,9 @@
 
     // stem and pin are drawn in map space, so they live outside the translated card
     const pins = layer.selectAll('g.pinset').data(config.regions, (r) => r.id).join('g').attr('class', 'pinset');
-    pins.append('line').attr('class', 'stem').each(function (r) {
-      const p = regionPos[r.id]; const o = cardOrigin(r);
-      d3.select(this).attr('x1', p.x).attr('y1', p.y).attr('x2', p.x).attr('y2', o.north ? o.y + CARD.h : o.y);
+    pins.append('line').attr('class', 'stem').attr('id', (r) => 'stem-' + r.id).each(function (r) {
+      const p = regionPos[r.id]; const a = edgeAnchor(cardOrigin(r), p);
+      d3.select(this).attr('x1', a.x).attr('y1', a.y).attr('x2', p.x).attr('y2', p.y);
     });
     pins.append('circle').attr('class', 'pin-ring').attr('id', (r) => 'ring-' + r.id).attr('r', 9)
       .attr('cx', (r) => regionPos[r.id].x).attr('cy', (r) => regionPos[r.id].y);
@@ -132,6 +180,7 @@
       card.select('.card-count').text(`${region.healthyCount}/${region.targetSize}`);
       d3.select('#pin-' + cfg.id).attr('class', 'pin ' + health);
       d3.select('#ring-' + cfg.id).attr('class', 'pin-ring ' + health);
+      d3.select('#stem-' + cfg.id).attr('class', 'stem ' + health);
       renderZones(card, region);
     });
 
@@ -359,47 +408,24 @@
     };
   }
 
-  // ---------- server ----------
+  // ---------- backend ----------
   function connect() {
-    const conn = new signalR.HubConnectionBuilder()
-      .withUrl('/hubs/fleet')
-      .withAutomaticReconnect([0, 1000, 3000, 5000, 10000])
-      .build();
-
-    conn.on('state', (update) => {
-      render(update);
-      spawn(update.requests);
-    });
-
     const status = (on, text) => {
       const el = $('conn');
       el.textContent = text;
       el.classList.toggle('on', on);
       el.classList.toggle('off', !on);
     };
-    conn.onreconnecting(() => status(false, 'reconnecting'));
-    conn.onreconnected(() => status(true, 'live'));
-    conn.onclose(() => status(false, 'offline'));
 
-    conn.start().then(() => status(true, 'live')).catch((err) => {
-      console.error(err);
-      status(false, 'offline');
-    });
+    backend.start((update) => {
+      render(update);
+      spawn(update.requests);
+    }, status);
   }
 
-  async function post(path, body) {
-    try {
-      const res = await fetch('/api/chaos/' + path, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body ?? {}),
-      });
-      if (res.status === 429) return toast('Easy there. Too many actions from your connection.', 'warn');
-      const json = await res.json().catch(() => null);
-      toast(json?.message ?? 'Request failed', res.ok && json?.ok ? 'ok' : 'warn');
-    } catch {
-      toast('Could not reach the server.', 'warn');
-    }
+  async function post(kind, body) {
+    const { body: result } = await backend.act(kind, body);
+    toast(result?.message ?? 'Request failed', result?.ok ? 'ok' : 'warn');
   }
 
   // ---------- controls ----------

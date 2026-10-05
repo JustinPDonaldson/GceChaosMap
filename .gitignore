@@ -7,3 +7,6 @@ appsettings.*.local.json
 *.tfstate
 *.tfstate.*
 .terraform/
+terraform.tfvars
+*.tfplan
+tfplan

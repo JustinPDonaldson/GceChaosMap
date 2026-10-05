@@ -74,7 +74,10 @@ body {
 .card-count { font: 700 11px var(--mono); text-anchor: end; fill: var(--ok); }
 .card.partial .card-count { fill: var(--warn); }
 .card.empty .card-count { fill: var(--bad); }
-.stem { stroke: #2a3b5c; stroke-width: 1; stroke-dasharray: 2 2; }
+.stem { stroke: #4a65a0; stroke-width: 1.5; transition: stroke .3s; }
+.stem.full { stroke: #2bb580; }
+.stem.partial { stroke: #d99a2b; }
+.stem.empty { stroke: #e0525f; }
 .pin { fill: var(--ok); transition: fill .3s; }
 .pin-ring { fill: none; stroke: var(--ok); stroke-width: 1; opacity: .5; transition: stroke .3s; }
 .card.partial ~ .pin, .pin.partial { fill: var(--warn); }

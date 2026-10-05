@@ -5,10 +5,16 @@ using Microsoft.Extensions.Options;
 namespace ChaosMap.Api.Providers;
 
 /// <summary>
-/// Real Compute Engine backend. Reads one regional MIG per region and breaks the fleet by deleting VMs;
-/// the MIG's own autohealing / target-size reconciliation is what "recovers" - this class never recreates anything.
-/// Only VMs that appear in a configured MIG's managed-instance list can be deleted, so a caller cannot
-/// use the API to delete arbitrary instances in the project.
+/// Real Compute Engine backend. Reads one regional MIG per region and breaks the fleet through the Compute API;
+/// the MIG's own reconciliation and autohealing do the recovering.
+///
+/// A VM kill is a plain delete. A zone or region "outage" is a real evacuation: the zone is removed from the MIG's
+/// distribution policy (or the MIG is resized to zero) so replacements cannot land there, and after a timeout the
+/// original configuration is restored. "Down" is always derived from what Compute Engine reports, not from memory,
+/// so an outage that outlives this process is still noticed and restored.
+///
+/// Only VMs that appear in a configured MIG's managed-instance list can be deleted, so a caller cannot use the API
+/// to delete arbitrary instances in the project.
 /// </summary>
 public sealed class GceFleetProvider : IFleetProvider
 {
@@ -18,7 +24,8 @@ public sealed class GceFleetProvider : IFleetProvider
     private readonly ILogger<GceFleetProvider> _log;
     private readonly RegionInstanceGroupManagersClient _migs;
     private readonly InstancesClient _instances;
-    private readonly SemaphoreSlim _pollGate = new(1, 1);
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly Dictionary<string, RegionState> _state = [];
 
     private FleetSnapshot _last;
     private DateTimeOffset _lastPoll = DateTimeOffset.MinValue;
@@ -46,14 +53,18 @@ public sealed class GceFleetProvider : IFleetProvider
 
     public async Task<FleetSnapshot> RefreshAsync(CancellationToken ct)
     {
-        await _pollGate.WaitAsync(ct);
+        await _gate.WaitAsync(ct);
         try
         {
             var now = _time.GetUtcNow();
             if ((now - _lastPoll).TotalSeconds < _gce.PollSeconds) return _last;
 
-            var regions = await Task.WhenAll(_fleet.Regions.Select(r => ReadRegionAsync(r, now, ct)));
-            _last = new FleetSnapshot(now, Mode, regions);
+            var reads = await Task.WhenAll(_fleet.Regions.Select(r => ReadRegionAsync(r, now, ct)));
+            foreach (var read in reads) _state[read.Def.Id] = read.State with { RestoreAt = _state.GetValueOrDefault(read.Def.Id)?.RestoreAt };
+
+            foreach (var def in _fleet.Regions) await RestoreWhenDueAsync(def, now, ct);
+
+            _last = new FleetSnapshot(now, Mode, reads.Select(r => Overlay(r, _state[r.Def.Id])).ToList());
             _lastPoll = now;
             return _last;
         }
@@ -66,7 +77,7 @@ public sealed class GceFleetProvider : IFleetProvider
         }
         finally
         {
-            _pollGate.Release();
+            _gate.Release();
         }
     }
 
@@ -77,42 +88,165 @@ public sealed class GceFleetProvider : IFleetProvider
         if (vm is null) return new ChaosResult(false, $"{instanceName} is not part of a managed fleet.");
         if (vm.State == InstanceState.Stopping) return new ChaosResult(false, $"{instanceName} is already stopping.");
 
-        await DeleteAsync(vm, ct);
-        return new ChaosResult(true, $"Deleted {vm.Name} in {vm.Zone}.", 1);
+        return await GuardedAsync(async () =>
+        {
+            await DeleteAsync(vm, ct);
+            return new ChaosResult(true, $"Deleted {vm.Name} in {vm.Zone}.", 1);
+        });
     }
 
-    // The following method deletes all live instances in a specified zone. It first filters the instances in the last known fleet snapshot to find those that are in the specified zone and are not already stopping. If there are no such instances, it returns a result indicating that there are no live instances to delete. Otherwise, it asynchronously deletes each of the identified instances and returns a result indicating how many instances were deleted.
     public async Task<ChaosResult> KillZoneAsync(string zoneId, CancellationToken ct)
     {
-        var victims = _last.Regions.SelectMany(r => r.Zones)
-            .Where(z => z.Id == zoneId)
+        await _gate.WaitAsync(ct);
+        try
+        {
+            var def = _fleet.Regions.FirstOrDefault(r => r.Zones.Any(z => $"{r.Id}-{z}" == zoneId));
+            if (def is null || !_state.TryGetValue(def.Id, out var state)) return new ChaosResult(false, $"No zone named {zoneId}.");
+            if (!state.ActiveZones.Contains(zoneId)) return new ChaosResult(false, $"{zoneId} is already down.");
+            if (state.ActiveZones.Count == 1) return new ChaosResult(false, $"{zoneId} is the last zone serving {def.Id}. Use Fail region instead.");
+
+            return await GuardedAsync(async () =>
+            {
+                var remaining = state.ActiveZones.Where(z => z != zoneId).ToList();
+                await PatchZonesAsync(def, remaining, ct);
+
+                state.ActiveZones.Remove(zoneId);
+                state.RestoreAt = _time.GetUtcNow().AddSeconds(_gce.OutageSeconds);
+
+                var victims = LiveInstances(z => z.Id == zoneId);
+                var deleted = await DeleteAllAsync(victims, ct);
+                return new ChaosResult(true, $"Zone {zoneId} evacuated; {deleted} instances deleted.", deleted);
+            });
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<ChaosResult> KillRegionAsync(string regionId, CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            var def = _fleet.Regions.FirstOrDefault(r => r.Id == regionId);
+            if (def is null || !_state.TryGetValue(def.Id, out var state)) return new ChaosResult(false, $"No region named {regionId}.");
+            if (state.TargetSize == 0) return new ChaosResult(false, $"{regionId} is already down.");
+
+            return await GuardedAsync(async () =>
+            {
+                var count = LiveInstances(z => z.Id.StartsWith(regionId + "-", StringComparison.Ordinal)).Count;
+
+                // Resizing to zero makes the MIG delete everything and stops it rebuilding until we restore the size.
+                await _migs.ResizeAsync(_gce.ProjectId, def.Id, def.MigName, 0, ct);
+                _log.LogWarning("Chaos: resized {Mig} to 0", def.MigName);
+
+                state.TargetSize = 0;
+                state.RestoreAt = _time.GetUtcNow().AddSeconds(_gce.OutageSeconds);
+                return new ChaosResult(true, $"Region {regionId} evacuated; {count} instances going away.", count);
+            });
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<ChaosResult> ResetAsync(CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            var restored = 0;
+            foreach (var def in _fleet.Regions)
+            {
+                if (!_state.TryGetValue(def.Id, out var state) || !IsDegraded(def, state)) continue;
+                await RestoreAsync(def, state, ct);
+                restored++;
+            }
+            _lastPoll = DateTimeOffset.MinValue; // show the restored configuration on the next tick
+            return new ChaosResult(true, restored == 0
+                ? "Nothing to restore: the MIGs already have their full configuration."
+                : $"Restored {restored} region(s). Replacement VMs take a couple of minutes to boot.");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Reset failed");
+            return new ChaosResult(false, "Compute Engine refused the restore: " + FirstLine(ex.Message));
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    private async Task RestoreWhenDueAsync(RegionOptions def, DateTimeOffset now, CancellationToken ct)
+    {
+        var state = _state[def.Id];
+        if (!IsDegraded(def, state))
+        {
+            state.RestoreAt = null;
+            return;
+        }
+
+        // Also covers an outage that started before this process did: it gets a timer the first time it is seen.
+        state.RestoreAt ??= now.AddSeconds(_gce.OutageSeconds);
+        if (now < state.RestoreAt) return;
+
+        _log.LogWarning("Chaos: restoring {Mig}", def.MigName);
+        await RestoreAsync(def, state, ct);
+    }
+
+    private async Task RestoreAsync(RegionOptions def, RegionState state, CancellationToken ct)
+    {
+        var allZones = def.Zones.Select(z => $"{def.Id}-{z}").ToList();
+        if (!allZones.All(state.ActiveZones.Contains)) await PatchZonesAsync(def, allZones, ct);
+        if (state.TargetSize == 0) await _migs.ResizeAsync(_gce.ProjectId, def.Id, def.MigName, _fleet.TargetPerRegion, ct);
+
+        state.ActiveZones = [.. allZones];
+        state.TargetSize = _fleet.TargetPerRegion;
+        state.RestoreAt = null;
+    }
+
+    private bool IsDegraded(RegionOptions def, RegionState state) =>
+        state.ActiveZones.Count < def.Zones.Length || (state.TargetSize == 0 && _fleet.TargetPerRegion > 0);
+
+    private Task PatchZonesAsync(RegionOptions def, IEnumerable<string> zoneIds, CancellationToken ct)
+    {
+        var policy = new DistributionPolicy();
+        policy.Zones.AddRange(zoneIds.Select(z => new DistributionPolicyZoneConfiguration { Zone = $"projects/{_gce.ProjectId}/zones/{z}" }));
+
+        _log.LogWarning("Chaos: setting {Mig} zones to {Zones}", def.MigName, string.Join(",", zoneIds));
+        return _migs.PatchAsync(new PatchRegionInstanceGroupManagerRequest
+        {
+            Project = _gce.ProjectId,
+            Region = def.Id,
+            InstanceGroupManager = def.MigName,
+            InstanceGroupManagerResource = new InstanceGroupManager { DistributionPolicy = policy },
+        }, ct);
+    }
+
+    private List<InstanceInfo> LiveInstances(Func<ZoneInfo, bool> zoneFilter) =>
+        _last.Regions.SelectMany(r => r.Zones).Where(zoneFilter)
             .SelectMany(z => z.Instances)
             .Where(i => i.State != InstanceState.Stopping)
             .ToList();
-        if (victims.Count == 0) return new ChaosResult(false, $"No live instances in {zoneId}.");
 
-        await Task.WhenAll(victims.Select(v => DeleteAsync(v, ct)));
-        return new ChaosResult(true, $"Deleted {victims.Count} instances in {zoneId}.", victims.Count);
-    }
-
-    // The following method deletes all live instances in a specified region. It first filters the instances in the last known fleet snapshot to find those that are in the specified region and are not already stopping. If there are no such instances, it returns a result indicating that there are no live instances to delete. Otherwise, it asynchronously deletes each of the identified instances and returns a result indicating how many instances were deleted.
-    public async Task<ChaosResult> KillRegionAsync(string regionId, CancellationToken ct)
+    /// <summary>Deletes in parallel; one VM already being removed by the MIG must not abort the rest.</summary>
+    private async Task<int> DeleteAllAsync(IEnumerable<InstanceInfo> victims, CancellationToken ct)
     {
-        var victims = _last.Regions.Where(r => r.Id == regionId)
-            .SelectMany(r => r.Zones).SelectMany(z => z.Instances)
-            .Where(i => i.State != InstanceState.Stopping)
-            .ToList();
-        if (victims.Count == 0) return new ChaosResult(false, $"No live instances in {regionId}.");
-
-        await Task.WhenAll(victims.Select(v => DeleteAsync(v, ct)));
-        return new ChaosResult(true, $"Deleted {victims.Count} instances in {regionId}.", victims.Count);
+        var results = await Task.WhenAll(victims.Select(async v =>
+        {
+            try { await DeleteAsync(v, ct); return true; }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _log.LogWarning("Could not delete {Instance}: {Reason}", v.Name, FirstLine(ex.Message));
+                return false;
+            }
+        }));
+        return results.Count(ok => ok);
     }
 
-    // The following method resets the fleet to its initial state. It returns a result indicating that there is nothing to reset, as the MIGs restore their target size on their own.
-    public Task<ChaosResult> ResetAsync(CancellationToken ct) =>
-        Task.FromResult(new ChaosResult(true, "Nothing to reset: the MIGs restore their target size on their own."));
-
-    // The following method deletes a specified instance. It logs a warning indicating that the instance is being deleted and then calls the GCE API to delete the instance. The deletion operation is not awaited to completion, as the poll loop observes the result.
     private async Task DeleteAsync(InstanceInfo vm, CancellationToken ct)
     {
         _log.LogWarning("Chaos: deleting {Instance} in {Zone}", vm.Name, vm.Zone);
@@ -120,10 +254,32 @@ public sealed class GceFleetProvider : IFleetProvider
         await _instances.DeleteAsync(_gce.ProjectId, vm.Zone, vm.Name, ct);
     }
 
-    /// The following method reads the state of a specified region. It first creates a dictionary to group instances by zone. It then sends a request to the GCE API to list the managed instances in the specified region and iterates through the results. For each instance, it extracts the zone from the instance URL and adds the instance information to the corresponding zone in the dictionary. Finally, it creates a list of ZoneInfo objects and returns a RegionInfo object containing the region's information and the list of zones.
-    private async Task<RegionInfo> ReadRegionAsync(RegionOptions def, DateTimeOffset now, CancellationToken ct)
+    /// <summary>A refused call becomes a message the visitor can read, never a 500.</summary>
+    private async Task<ChaosResult> GuardedAsync(Func<Task<ChaosResult>> action)
+    {
+        try
+        {
+            return await action();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log.LogWarning(ex, "Compute Engine rejected a chaos action");
+            return new ChaosResult(false, "Compute Engine refused that: " + FirstLine(ex.Message));
+        }
+    }
+
+    private async Task<RegionRead> ReadRegionAsync(RegionOptions def, DateTimeOffset now, CancellationToken ct)
     {
         var byZone = def.Zones.ToDictionary(z => $"{def.Id}-{z}", _ => new List<InstanceInfo>());
+
+        var mig = await _migs.GetAsync(_gce.ProjectId, def.Id, def.MigName, ct);
+        var policyZones = mig.DistributionPolicy?.Zones.Select(z => LastSegment(z.Zone)).Where(z => z.Length > 0).ToList() ?? [];
+        var state = new RegionState
+        {
+            // No policy at all means every zone is in use.
+            ActiveZones = policyZones.Count == 0 ? [.. byZone.Keys] : [.. policyZones.Where(byZone.ContainsKey)],
+            TargetSize = mig.TargetSize,
+        };
 
         var request = new ListManagedInstancesRegionInstanceGroupManagersRequest
         {
@@ -138,17 +294,25 @@ public sealed class GceFleetProvider : IFleetProvider
             if (zone is null || !byZone.TryGetValue(zone, out var list)) continue;
 
             var health = mi.InstanceHealth.Select(h => h.DetailedHealthState).FirstOrDefault();
-            var state = MapState(mi.CurrentAction, mi.InstanceStatus, health);
             var name = mi.Instance[(mi.Instance.LastIndexOf('/') + 1)..];
-            list.Add(new InstanceInfo(name, def.Id, zone, state, now));
+            list.Add(new InstanceInfo(name, def.Id, zone, MapState(mi.CurrentAction, mi.InstanceStatus, health), now));
         }
 
-        var zones = byZone
-            .Select(kv => new ZoneInfo(kv.Key, false, kv.Value.OrderBy(i => i.Name, StringComparer.Ordinal).ToList()))
+        return new RegionRead(def, state, byZone);
+    }
+
+    private RegionInfo Overlay(RegionRead read, RegionState state)
+    {
+        var regionDown = state.TargetSize == 0 && _fleet.TargetPerRegion > 0;
+        var zones = read.ByZone
+            .Select(kv => new ZoneInfo(
+                kv.Key,
+                regionDown || !state.ActiveZones.Contains(kv.Key),
+                kv.Value.OrderBy(i => i.Name, StringComparer.Ordinal).ToList()))
             .ToList();
 
         return new RegionInfo(
-            def.Id, def.Name, def.Lat, def.Lon,
+            read.Def.Id, read.Def.Name, read.Def.Lat, read.Def.Lon,
             _fleet.TargetPerRegion,
             zones.Sum(z => z.Instances.Count(i => i.State == InstanceState.Healthy)),
             zones);
@@ -157,6 +321,8 @@ public sealed class GceFleetProvider : IFleetProvider
     private static RegionInfo EmptyRegion(RegionOptions def) => new(
         def.Id, def.Name, def.Lat, def.Lon, 0, 0,
         def.Zones.Select(z => new ZoneInfo($"{def.Id}-{z}", false, [])).ToList());
+
+    private static string FirstLine(string text) => text.Split('\n', 2)[0].Trim();
 
     /// <summary>Extracts "us-central1-a" from ".../zones/us-central1-a/instances/web-x".</summary>
     internal static string? ZoneFromUrl(string? instanceUrl)
@@ -169,6 +335,10 @@ public sealed class GceFleetProvider : IFleetProvider
         var end = instanceUrl.IndexOf('/', start);
         return end < 0 ? null : instanceUrl[start..end];
     }
+
+    /// <summary>"projects/p/zones/us-central1-a" (or a full URL) to "us-central1-a".</summary>
+    internal static string LastSegment(string? url) =>
+        string.IsNullOrEmpty(url) ? "" : url[(url.LastIndexOf('/') + 1)..];
 
     /// <summary>
     /// Collapses the MIG's currentAction, the VM's status and the autohealing health check into the five states the map draws.
@@ -190,8 +360,17 @@ public sealed class GceFleetProvider : IFleetProvider
         if (string.IsNullOrEmpty(instanceStatus) && currentAction is "CREATING" or "RECREATING")
             return InstanceState.Provisioning;
 
-        // RUNNING from here on: a VM is only "healthy" once its settled and, if a health check exists, it passes it.
+        // RUNNING from here on: a VM is only "healthy" once it is settled and, if a health check exists, passing it.
         if (currentAction is not (null or "" or "NONE")) return InstanceState.Starting;
         return string.IsNullOrEmpty(health) || health == "HEALTHY" ? InstanceState.Healthy : InstanceState.Starting;
     }
+
+    private sealed record RegionState
+    {
+        public HashSet<string> ActiveZones { get; set; } = [];
+        public int TargetSize { get; set; }
+        public DateTimeOffset? RestoreAt { get; set; }
+    }
+
+    private sealed record RegionRead(RegionOptions Def, RegionState State, Dictionary<string, List<InstanceInfo>> ByZone);
 }
