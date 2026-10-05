@@ -1,3 +1,8 @@
+# Check out the simulation here:
+
+https://justinpdonaldson.github.io/GceChaosMap/
+
+
 # GCE Chaos Map
 
 An interactive world map of a multi-region Compute Engine fleet. Visitors delete a VM, fail a zone, or take out a whole region and watch:
@@ -79,9 +84,4 @@ Known differences from simulation:
 - On phone widths the region cards are small; the panels below the map are the readable part.
 - Map libraries and land outlines load from jsDelivr. Vendor them into `wwwroot/lib` for offline or locked-down hosting.
 
-## Next steps
 
-1. Terraform for the sandbox project: VPC, instance template, four regional MIGs with autohealing, global external Application Load Balancer, least-privilege service account.
-2. Run `GceFleetProvider` against it and fix whatever real Compute Engine disagrees with.
-3. Real zone drain via the MIG distribution policy.
-4. Deploy the app (Cloud Run or a small VM behind the same LB), budget alert, and a "replay mode" fallback when the live fleet is off.
